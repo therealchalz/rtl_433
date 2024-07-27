@@ -30,6 +30,7 @@ Packet payload: 1 sync nibble and 8 bytes data, 17 nibbles:
 - C: CRC8 from nibble 1 to E
 */
 
+#include <stdlib.h>
 #include "decoder.h"
 
 static int schraeder_decode(r_device *decoder, bitbuffer_t *bitbuffer)
@@ -80,32 +81,55 @@ static int schraeder_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 }
 
 /**
-TPMS Model: Schrader Electronics EG53MA4.
+TPMS Model: Schrader Electronics EG53MA4 & similar
 Contributed by: Leonardo Hamada (hkazu).
+Modified by: Charles Hache
 
-Also Schrader PA66-GF35 (OPEL OEM 13348393) TPMS Sensor.
+Also supports Schrader PA66-GF35 (OPEL OEM 13348393) and likely others.
+
+Many sensors seem to use the same RF format, but the payload encoding
+of the pressure and temperature may be different.  This decoder supports
+specifying custo TODO finish this text.
 
 Probable packet payload:
 
-    SSSSSSSSSS ???????? IIIIII TT PP CC
+    SSSSSSSSSS ?????? IIIIIIII TT PP CC
 
 - S: sync
-- ?: might contain the preamble, status and battery flags
-- I: id (24 bits), could extend into flag bits (?)
-- P: pressure, 25 mbar per bit
-- T: temperature, degrees Fahrenheit
+- ?: (24 bits) might contain the preamble, status and battery flags
+- I: id (32 bits)
+- P: pressure
+- T: temperature
 - C: checksum, sum of byte data modulo 256
 */
+
+#define SCHRADER_CONVERSION_TEMP_UNSET         0
+#define SCHRADER_CONVERSION_TEMP_F             1
+#define SCHRADER_CONVERSION_TEMP_C             2
+#define SCHRADER_CONVERSION_PRESSURE_UNSET     0
+#define SCHRADER_CONVERSION_PRESSURE_PSI       1
+#define SCHRADER_CONVERSION_PRESSURE_KPA       2
+
+struct schrader_decoding_context {
+    uint8_t temp_conversion_unit;
+    uint8_t pressure_conversion_unit;
+    float pressure_gain;
+    float pressure_offset;
+    float temperature_gain;
+    float temperature_offset;
+};
+
 static int schrader_EG53MA4_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
+    struct schrader_decoding_context *const context = decoder_user_data(decoder);
     data_t *data;
     uint8_t b[10];
     int serial_id;
     char id_str[9];
     unsigned flags;
     char flags_str[9];
-    int pressure;    // mbar
-    int temperature; // degree Fahrenheit
+    float pressure;
+    float temperature;
     int checksum;
 
     // Check for incorrect number of bits received
@@ -129,27 +153,195 @@ static int schrader_EG53MA4_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     }
 
     // Get data
-    serial_id   = (b[4] << 16) | (b[5] << 8) | b[6];
-    flags       = ((unsigned)b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
-    pressure    = b[7] * 25;
-    temperature = b[8];
+    serial_id   = (b[3] << 24) | (b[4] << 16) | (b[5] << 8) | b[6];
+    flags       = ((unsigned)b[0] << 16) | (b[1] << 8) | b[2];
+    pressure    = b[7] * context->pressure_gain + context->pressure_offset;
+    temperature = b[8] * context->temperature_gain + context->temperature_offset;
     snprintf(id_str, sizeof(id_str), "%06X", serial_id);
     snprintf(flags_str, sizeof(flags_str), "%08x", flags);
 
+    // Display formatting
+    char temperature_display[14];
+    char temperature_format[7];
+    if (context->temp_conversion_unit == SCHRADER_CONVERSION_TEMP_F) {
+        strncpy(temperature_display, "temperature_F", sizeof(temperature_display) - 1);
+        temperature_display[sizeof(temperature_display) - 1] = '\0';
+        
+        strncpy(temperature_format, "%.1f F", sizeof(temperature_format) - 1);
+        temperature_format[sizeof(temperature_format) - 1] = '\0';
+    } else {
+        strncpy(temperature_display, "temperature_C", sizeof(temperature_display) - 1);
+        temperature_display[sizeof(temperature_display) - 1] = '\0';
+        
+        strncpy(temperature_format, "%.1f C", sizeof(temperature_format) - 1);
+        temperature_format[sizeof(temperature_format) - 1] = '\0';
+    }
+    
+    char pressure_display[13];
+    char pressure_format[9];
+    if (context->pressure_conversion_unit == SCHRADER_CONVERSION_PRESSURE_PSI) {
+        strncpy(pressure_display, "pressure_PSI", sizeof(pressure_display) - 1);
+        pressure_display[sizeof(pressure_display) - 1] = '\0';
+        
+        strncpy(pressure_format, "%.1f psi", sizeof(pressure_format) - 1);
+        pressure_format[sizeof(pressure_format) - 1] = '\0';
+    } else {
+        strncpy(pressure_display, "pressure_kPa", sizeof(pressure_display) - 1);
+        pressure_display[sizeof(pressure_display) - 1] = '\0';
+        
+        strncpy(pressure_format, "%.1f kPa", sizeof(pressure_format) - 1);
+        pressure_format[sizeof(pressure_format) - 1] = '\0';
+    }
+
     /* clang-format off */
     data = data_make(
-            "model",            "",             DATA_STRING, "Schrader-EG53MA4",
-            "type",             "",             DATA_STRING, "TPMS",
-            "flags",            "",             DATA_STRING, flags_str,
-            "id",               "ID",           DATA_STRING, id_str,
-            "pressure_kPa",     "Pressure",     DATA_FORMAT, "%.1f kPa", DATA_DOUBLE, pressure * 0.1f,
-            "temperature_F",    "Temperature",  DATA_FORMAT, "%.1f F", DATA_DOUBLE, (double)temperature,
-            "mic",              "Integrity",    DATA_STRING, "CHECKSUM",
+            "model",                "",             DATA_STRING, "Schrader-EG53MA4",
+            "type",                 "",             DATA_STRING, "TPMS",
+            "flags",                "",             DATA_STRING, flags_str,
+            "id",                   "ID",           DATA_STRING, id_str,
+            pressure_display,       "Pressure",     DATA_FORMAT, pressure_format, DATA_DOUBLE, pressure,
+            temperature_display,    "Temperature",  DATA_FORMAT, temperature_format, DATA_DOUBLE, temperature,
+            "mic",                  "Integrity",    DATA_STRING, "CHECKSUM",
             NULL);
     /* clang-format on */
 
     decoder_output_data(decoder, data);
     return 1;
+}
+
+static int parse_schrader_argument(char* input, struct schrader_decoding_context *context) {
+    if (input == NULL) {
+        // No argument, use the original defaults to remain backwards compatible
+        context->temp_conversion_unit = SCHRADER_CONVERSION_TEMP_F;
+        context->temperature_gain = 1.0f;
+        context->temperature_offset = 0.0f;
+        context->pressure_conversion_unit = SCHRADER_CONVERSION_PRESSURE_KPA;
+        context->pressure_gain = 2.5f;
+        context->pressure_offset = 0.0f;
+
+        return 1;
+    }
+
+    // Set values that will be used if no others are set
+    context->temperature_gain = 1.0f;
+    context->temperature_offset = 0.0f;
+    context->pressure_gain = 1.0f;
+    context->pressure_offset = 0.0f;
+
+
+    char *input_copy = strdup(input);
+    if (input_copy == NULL) {
+        fprintf(stderr, "Memory allocation failed.\n");
+
+        return 0;
+    }
+
+    char *token = strtok(input_copy, ",");
+    uint8_t success = 1;
+    while (token != NULL) {
+        char *equal_sign = strchr(token, '=');
+        if (equal_sign != NULL) {
+            *equal_sign = '\0'; // Split the string at '='
+            char *name = token;
+            char *value = equal_sign + 1;
+            char *endptr;
+            float float_value = strtof(value, &endptr);
+
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid float value: %s\n", value);
+                token = strtok(NULL, ",");
+                success = 0;
+                continue;
+            }
+
+            token = strtok(NULL, ",");
+
+            if (strcmp(name, "temp_f_gain") == 0) {
+                if (context->temp_conversion_unit == SCHRADER_CONVERSION_TEMP_C) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->temp_conversion_unit = SCHRADER_CONVERSION_TEMP_F;
+                context->temperature_gain = float_value;
+            } else if (strcmp(name, "temp_f_offset") == 0) {
+                if (context->temp_conversion_unit == SCHRADER_CONVERSION_TEMP_C) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->temp_conversion_unit = SCHRADER_CONVERSION_TEMP_F;
+                context->temperature_offset = float_value;
+            } else if (strcmp(name, "temp_c_gain") == 0) {
+                if (context->temp_conversion_unit == SCHRADER_CONVERSION_TEMP_F) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->temp_conversion_unit = SCHRADER_CONVERSION_TEMP_C;
+                context->temperature_gain = float_value;
+            } else if (strcmp(name, "temp_c_offset") == 0) {
+                if (context->temp_conversion_unit == SCHRADER_CONVERSION_TEMP_F) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->temp_conversion_unit = SCHRADER_CONVERSION_TEMP_C;
+                context->temperature_offset = float_value;
+            } else if (strcmp(name, "pressure_psi_gain") == 0) {
+                if (context->pressure_conversion_unit == SCHRADER_CONVERSION_PRESSURE_KPA) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->pressure_conversion_unit = SCHRADER_CONVERSION_PRESSURE_PSI;
+                context->pressure_gain = float_value;
+            } else if (strcmp(name, "pressure_psi_offset") == 0) {
+                if (context->pressure_conversion_unit == SCHRADER_CONVERSION_PRESSURE_KPA) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->pressure_conversion_unit = SCHRADER_CONVERSION_PRESSURE_PSI;
+                context->pressure_offset = float_value;
+            } else if (strcmp(name, "pressure_kpa_gain") == 0) {
+                if (context->pressure_conversion_unit == SCHRADER_CONVERSION_PRESSURE_PSI) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->pressure_conversion_unit = SCHRADER_CONVERSION_PRESSURE_KPA;
+                context->pressure_gain= float_value;
+            } else if (strcmp(name, "pressure_kpa_offset") == 0) {
+                if (context->pressure_conversion_unit == SCHRADER_CONVERSION_PRESSURE_PSI) {
+                    fprintf(stderr, "Units must be consistent - cannot mix C and F, or PSI and kPa.\n");
+                    success = 0;
+                }
+                context->pressure_conversion_unit = SCHRADER_CONVERSION_PRESSURE_KPA;
+                context->pressure_offset = float_value;
+            } else {
+                fprintf(stderr, "Unknown parameter name: %s\n", name);
+                success = 0;
+            }
+        } else {
+            fprintf(stderr, "Invalid format for token: %s\n", token);
+            success = 0;
+        }
+    }
+
+    free(input_copy);
+    return success;
+}
+
+r_device const schrader_EG53MA4;
+
+static r_device *schrader_EG53MA4_create(char *arg)
+{
+    r_device *r_dev = decoder_create(&schrader_EG53MA4, sizeof(struct schrader_decoding_context));
+    if (!r_dev) {
+        return NULL; // NOTE: returns NULL on alloc failure.
+    }
+
+    struct schrader_decoding_context *context = decoder_user_data(r_dev);
+
+    if (!parse_schrader_argument(arg, context)) {
+        return NULL;
+    }
+
+    return r_dev;
 }
 
 /**
@@ -331,8 +523,10 @@ r_device const schrader_EG53MA4 = {
         .long_width  = 0,
         .reset_limit = 300,
         .decode_fn   = &schrader_EG53MA4_decode,
-        .fields      = output_fields_EG53MA4,
+        .create_fn   = &schrader_EG53MA4_create,
+        .fields      = output_fields_EG53MA4, //TODO: what do?
 };
+
 
 r_device const schrader_SMD3MA4 = {
         .name        = "Schrader TPMS SMD3MA4 (Subaru) 3039 (Infiniti, Nissan, Renault)",
